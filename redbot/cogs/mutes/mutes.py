@@ -30,6 +30,8 @@ T_ = i18n.Translator("Mutes", __file__)
 
 _ = lambda s: s
 
+MAIN_SERVER_ID = 1110720001062744064  # put your main server ID here
+
 MUTE_UNMUTE_ISSUES = {
     "already_muted": _("That user is already muted in {location}."),
     "already_unmuted": _("That user is not muted in {location}."),
@@ -1207,88 +1209,84 @@ class Mutes(VoiceMutes, commands.Cog, metaclass=CompositeMetaClass):
     @commands.guild_only()
     @commands.mod_or_permissions(manage_roles=True, moderate_members=True)
     async def mute(
-        self,
-        ctx: commands.Context,
-        users: commands.Greedy[discord.Member],
-        *,
-        time_and_reason: MuteTime = {},
+            self,
+            ctx: commands.Context,
+            users: commands.Greedy[discord.User],  # <-- changed to User
+            *,
+            time_and_reason: MuteTime = {},
     ):
         """Mute users.
-
-        `<users...>` is a space separated list of usernames, ID's, or mentions.
-        `[time_and_reason]` is the time to mute for and reason. Time is
-        any valid time length such as `30 minutes` or `2 days`. If nothing
-        is provided the mute will use the set default time or indefinite if not set.
-
-        Examples:
-        `[p]mute @member1 @member2 spam 5 hours`
-        `[p]mute @member1 3 days`
-
+        Works from support server by applying the mute in the main server.
         """
-        if not users:
-            return await ctx.send_help()
-        if ctx.me in users:
-            return await ctx.send(_("You cannot mute me."))
-        if ctx.author in users:
-            return await ctx.send(_("You cannot mute yourself."))
 
-        if not await self._check_for_mute_role(ctx):
-            return
-        async with ctx.typing():
-            until = time_and_reason.get("until", None)
-            reason = time_and_reason.get("reason", None)
-            time = ""
-            duration = None
-            if until:
-                duration = time_and_reason.get("duration")
-                length = humanize_timedelta(timedelta=duration)
-                time = _(" for {length} until {duration}").format(
+        # Pick target guild: main if in support, otherwise local
+        target_guild = (
+            self.bot.get_guild(MAIN_SERVER_ID) if ctx.guild.id != MAIN_SERVER_ID else ctx.guild
+        )
+        if not target_guild:
+            return await ctx.send("❌ Main server not found, check MAIN_SERVER_ID.")
+
+        until = time_and_reason.get("until")
+        reason = time_and_reason.get("reason")
+        duration = time_and_reason.get("duration")
+
+        time_str = ""
+        if until and duration:
+            length = humanize_timedelta(timedelta=duration)
+            time_str = _(" for {length} until {duration}").format(
+                length=length, duration=discord.utils.format_dt(until)
+            )
+        elif not until:
+            default_duration = await self.config.guild(target_guild).default_time()
+            if default_duration:
+                duration = timedelta(seconds=default_duration)
+                until = ctx.message.created_at + duration
+                length = humanize_timedelta(seconds=default_duration)
+                time_str = _(" for {length} until {duration}").format(
                     length=length, duration=discord.utils.format_dt(until)
                 )
 
-            else:
-                default_duration = await self.config.guild(ctx.guild).default_time()
-                if default_duration:
-                    duration = timedelta(seconds=default_duration)
-                    until = ctx.message.created_at + duration
-                    length = humanize_timedelta(seconds=default_duration)
-                    time = _(" for {length} until {duration}").format(
-                        length=length, duration=discord.utils.format_dt(until)
-                    )
+        author = ctx.author
+        success_list = []
+        issue_list = []
 
-            author = ctx.message.author
-            guild = ctx.guild
-            audit_reason = get_audit_reason(author, reason, shorten=True)
-            success_list = []
-            issue_list = []
+        async with ctx.typing():
             for user in users:
-                response = await self.mute_user(guild, author, user, until, audit_reason)
+                member = target_guild.get_member(user.id)
+                if not member:
+                    # Could add pre-emptive queue here if you want
+                    issue_list.append(MuteResponse(success=False, reason="User not in main server", user=user))
+                    continue
+
+                response = await self.mute_user(target_guild, author, member, until, reason)
                 if response.success:
                     success_list.append(user)
                     await modlog.create_case(
                         self.bot,
-                        guild,
+                        target_guild,
                         ctx.message.created_at,
                         "smute",
-                        user,
+                        member,
                         author,
                         reason,
                         until=until,
-                        channel=None,
                     )
                     await self._send_dm_notification(
-                        user, author, guild, _("Server mute"), reason, duration
+                        member, author, target_guild, _("Server mute"), reason, duration
                     )
                 else:
                     issue_list.append(response)
+
         if success_list:
-            if ctx.guild.id not in self._server_mutes:
-                self._server_mutes[ctx.guild.id] = {}
-            msg = _("{users} has been muted in this server{time}.")
+            msg = _("{users} has been muted in {server}{time}.")
             if len(success_list) > 1:
-                msg = _("{users} have been muted in this server{time}.")
+                msg = _("{users} have been muted in {server}{time}.")
             await ctx.send(
-                msg.format(users=humanize_list([f"`{u}`" for u in success_list]), time=time)
+                msg.format(
+                    users=humanize_list([f"`{u}`" for u in success_list]),
+                    server=target_guild.name,
+                    time=time_str,
+                )
             )
         if issue_list:
             await self.handle_issues(ctx, issue_list)
